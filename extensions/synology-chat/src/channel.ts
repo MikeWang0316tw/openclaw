@@ -1,0 +1,798 @@
+// Import the correct function for getting replies from the agent system
+import { getReplyFromConfig } from "../../../src/auto-reply/reply.js";
+import {
+  buildChannelConfigSchema,
+  DEFAULT_ACCOUNT_ID,
+  type ChannelPlugin,
+  type ChannelStatusIssue,
+  type OpenClawConfig,
+  type PluginRuntime,
+} from "../../../src/plugin-sdk/index.js";
+import { SynologyChatConfigSchema } from "../../../src/synology-chat/config-schema.js";
+import { getSynologyChatRuntime } from "./runtime.js";
+
+type SynologyChatConfig = any;
+
+type ResolvedSynologyChatAccount = {
+  accountId: string;
+  name: string;
+  enabled: boolean;
+  config: SynologyChatConfig;
+  channelAccessToken?: string;
+  tokenSource: string;
+};
+
+// Synology Chat channel metadata
+const meta = {
+  id: "synology-chat",
+  label: "Synology Chat",
+  selectionLabel: "Synology Chat (Webhook)",
+  detailLabel: "Synology Chat Bot",
+  docsPath: "/channels/synology-chat",
+  docsLabel: "synology-chat",
+  blurb: "Synology Chat integration via incoming/outgoing webhooks.",
+  systemImage: "message.fill",
+};
+
+export const synologyChatPlugin: ChannelPlugin<ResolvedSynologyChatAccount> = {
+  id: "synology-chat",
+  meta: {
+    ...meta,
+    quickstartAllowFrom: true,
+  },
+  pairing: {
+    idLabel: "userId",
+    normalizeAllowEntry: (entry) => {
+      // Normalize user ID entries
+      return entry.replace(/^synology-chat:(?:user:)?/i, "");
+    },
+    notifyApproval: async ({ cfg, id }) => {
+      const runtime = getSynologyChatRuntime();
+      const account = synologyChatPlugin.config.resolveAccount(cfg, DEFAULT_ACCOUNT_ID);
+      if (!account.config.nasIncomingWebhookUrl) {
+        throw new Error("Synology Chat webhook URL not configured");
+      }
+      await sendMessageToSynologyChat(
+        account.config.nasIncomingWebhookUrl,
+        "OpenClaw: your access has been approved.",
+      );
+    },
+  },
+  capabilities: {
+    chatTypes: ["direct"], // Synology Chat primarily supports direct chats
+    reactions: false,
+    threads: false,
+    media: false, // Basic implementation without media support initially
+    nativeCommands: false,
+    blockStreaming: true,
+  },
+  reload: { configPrefixes: ["channels.synology-chat"] },
+  configSchema: buildChannelConfigSchema(SynologyChatConfigSchema),
+  config: {
+    listAccountIds: (cfg) => {
+      const synologyChatConfig = cfg.channels?.["synology-chat"] as SynologyChatConfig | undefined;
+      if (!synologyChatConfig) return [DEFAULT_ACCOUNT_ID];
+      return [DEFAULT_ACCOUNT_ID]; // Single account for basic implementation
+    },
+    resolveAccount: (cfg, accountId) => {
+      const baseConfig = cfg.channels?.["synology-chat"] as any;
+      const defaultConfig: SynologyChatConfig = {
+        nasIncomingWebhookUrl: "",
+        token: undefined,
+        botName: "openclaw",
+        incomingWebhookPath: "/synology-chat",
+        port: undefined, // Add port as undefined by default since handled by gateway
+        verificationToken: undefined, // Add verification token field
+        allowFrom: [],
+        dmPolicy: "pairing",
+      };
+
+      let accountConfig: SynologyChatConfig;
+      if (accountId === DEFAULT_ACCOUNT_ID) {
+        accountConfig = {
+          ...defaultConfig,
+          ...(baseConfig || {}),
+        };
+      } else {
+        const accounts = (baseConfig as any)?.accounts;
+        // Make sure accountId is a valid string before using as index
+        const validAccountId = accountId && typeof accountId === "string" ? accountId : "";
+        accountConfig = {
+          ...defaultConfig,
+          ...(accounts?.[validAccountId] || {}),
+        };
+      }
+
+      return {
+        accountId: accountId || DEFAULT_ACCOUNT_ID,
+        name: `Synology Chat ${accountId || "Default"}`,
+        enabled: (baseConfig as any)?.enabled !== false,
+        config: accountConfig,
+        channelAccessToken: accountConfig.token,
+        tokenSource: accountConfig.token ? "config" : "none",
+      } as ResolvedSynologyChatAccount;
+    },
+    defaultAccountId: (cfg) => DEFAULT_ACCOUNT_ID,
+    setAccountEnabled: ({ cfg, accountId, enabled }) => {
+      const synologyChatConfig = (cfg.channels?.["synology-chat"] ?? {}) as any;
+      if (accountId === DEFAULT_ACCOUNT_ID) {
+        return {
+          ...cfg,
+          channels: {
+            ...cfg.channels,
+            "synology-chat": {
+              ...synologyChatConfig,
+              enabled,
+            },
+          },
+        };
+      }
+      return {
+        ...cfg,
+        channels: {
+          ...cfg.channels,
+          "synology-chat": {
+            ...synologyChatConfig,
+            accounts: {
+              ...synologyChatConfig.accounts,
+              [accountId]: {
+                ...synologyChatConfig.accounts?.[accountId],
+                enabled,
+              },
+            },
+          },
+        },
+      };
+    },
+    deleteAccount: ({ cfg, accountId }) => {
+      const synologyChatConfig = (cfg.channels?.["synology-chat"] ?? {}) as any;
+      if (accountId === DEFAULT_ACCOUNT_ID) {
+        // Remove the entire synology-chat config
+        const newChannels = { ...cfg.channels };
+        delete newChannels["synology-chat"];
+        return {
+          ...cfg,
+          channels: newChannels,
+        };
+      }
+      const accounts = { ...synologyChatConfig.accounts };
+      delete accounts[accountId];
+      return {
+        ...cfg,
+        channels: {
+          ...cfg.channels,
+          "synology-chat": {
+            ...synologyChatConfig,
+            accounts: Object.keys(accounts).length > 0 ? accounts : undefined,
+          },
+        },
+      };
+    },
+    isConfigured: (account) => Boolean(account.config.nasIncomingWebhookUrl?.trim()),
+    describeAccount: (account) => ({
+      accountId: account.accountId,
+      name: account.name,
+      enabled: account.enabled,
+      configured: Boolean(account.config.nasIncomingWebhookUrl?.trim()),
+      tokenSource: account.tokenSource,
+    }),
+    resolveAllowFrom: ({ cfg, accountId }) => {
+      const account = synologyChatPlugin.config.resolveAccount(cfg, accountId);
+      return (account.config.allowFrom ?? []).map((entry) => String(entry));
+    },
+    formatAllowFrom: ({ allowFrom }) =>
+      allowFrom
+        .map((entry: any) => String(entry).trim())
+        .filter(Boolean)
+        .map((entry: string) => {
+          return entry.replace(/^synology-chat:(?:user:)?/i, "");
+        }),
+  },
+  security: {
+    resolveDmPolicy: ({ cfg, accountId, account }) => {
+      const resolvedAccountId = accountId ?? account.accountId ?? DEFAULT_ACCOUNT_ID;
+      const useAccountPath = Boolean(
+        (cfg.channels?.["synology-chat"] as any)?.accounts?.[resolvedAccountId],
+      );
+      const basePath = useAccountPath
+        ? `channels.synology-chat.accounts.${resolvedAccountId}.`
+        : "channels.synology-chat.";
+      return {
+        policy: account.config.dmPolicy ?? "pairing",
+        allowFrom: account.config.allowFrom ?? [],
+        policyPath: `${basePath}dmPolicy`,
+        allowFromPath: basePath,
+        approveHint: "openclaw pairing approve synology-chat <code>",
+        normalizeEntry: (raw) => raw.replace(/^synology-chat:(?:user:)?/i, ""),
+      };
+    },
+    collectWarnings: ({ account, cfg }) => {
+      return []; // No specific warnings for Synology Chat
+    },
+  },
+  groups: {
+    resolveRequireMention: ({ cfg, accountId, groupId }) => {
+      const account = synologyChatPlugin.config.resolveAccount(cfg, accountId);
+      const groups = account.config.groups;
+      if (!groups) {
+        return false;
+      }
+      const groupConfig = groups[groupId] ?? groups["*"];
+      return groupConfig?.requireMention ?? false;
+    },
+  },
+  messaging: {
+    normalizeTarget: (target) => {
+      const trimmed = target.trim();
+      if (!trimmed) {
+        return undefined;
+      }
+      const result = trimmed
+        .replace(/^synology-chat:(group|room|user):/i, "")
+        .replace(/^synology-chat:/i, "");
+      return result || undefined;
+    },
+    targetResolver: {
+      looksLikeId: (id) => {
+        const trimmed = id?.trim();
+        if (!trimmed) {
+          return false;
+        }
+        // Synology Chat user IDs are typically numeric or alphanumeric
+        return /^[a-zA-Z0-9_-]+$/.test(trimmed) || /^synology-chat:/i.test(trimmed);
+      },
+      hint: "<userId>",
+    },
+  },
+  directory: {
+    self: async () => null,
+    listPeers: async () => [],
+    listGroups: async () => [],
+  },
+  setup: {
+    resolveAccountId: ({ accountId }) => accountId || DEFAULT_ACCOUNT_ID,
+    applyAccountName: ({ cfg, accountId, name }) => {
+      const synologyChatConfig = (cfg.channels?.["synology-chat"] ?? {}) as any;
+      if (accountId === DEFAULT_ACCOUNT_ID) {
+        return {
+          ...cfg,
+          channels: {
+            ...cfg.channels,
+            "synology-chat": {
+              ...synologyChatConfig,
+              name,
+            },
+          },
+        };
+      }
+      return {
+        ...cfg,
+        channels: {
+          ...cfg.channels,
+          "synology-chat": {
+            ...synologyChatConfig,
+            accounts: {
+              ...synologyChatConfig.accounts,
+              [accountId]: {
+                ...synologyChatConfig.accounts?.[accountId],
+                name,
+              },
+            },
+          },
+        },
+      };
+    },
+    validateInput: ({ accountId, input }) => {
+      const typedInput = input as {
+        nasIncomingWebhookUrl?: string;
+        token?: string;
+        botName?: string;
+      };
+
+      if (!typedInput.nasIncomingWebhookUrl) {
+        return "Synology Chat requires nasIncomingWebhookUrl.";
+      }
+
+      try {
+        new URL(typedInput.nasIncomingWebhookUrl);
+      } catch (e) {
+        return "Invalid webhook URL provided.";
+      }
+
+      return null;
+    },
+    applyAccountConfig: ({ cfg, accountId, input }) => {
+      const typedInput = input as {
+        nasIncomingWebhookUrl: string;
+        token?: string;
+        botName?: string;
+        incomingWebhookPath?: string;
+      };
+
+      const synologyChatConfig = (cfg.channels?.["synology-chat"] ?? {}) as any;
+
+      if (accountId === DEFAULT_ACCOUNT_ID) {
+        return {
+          ...cfg,
+          channels: {
+            ...cfg.channels,
+            "synology-chat": {
+              ...synologyChatConfig,
+              enabled: true,
+              nasIncomingWebhookUrl: typedInput.nasIncomingWebhookUrl,
+              token: typedInput.token,
+              botName: typedInput.botName || "openclaw",
+              incomingWebhookPath: typedInput.incomingWebhookPath || "/synology-chat",
+            },
+          },
+        };
+      }
+
+      return {
+        ...cfg,
+        channels: {
+          ...cfg.channels,
+          "synology-chat": {
+            ...synologyChatConfig,
+            enabled: true,
+            accounts: {
+              ...synologyChatConfig.accounts,
+              [accountId]: {
+                ...synologyChatConfig.accounts?.[accountId],
+                enabled: true,
+                nasIncomingWebhookUrl: typedInput.nasIncomingWebhookUrl,
+                token: typedInput.token,
+                botName: typedInput.botName || "openclaw",
+                incomingWebhookPath: typedInput.incomingWebhookPath || "/synology-chat",
+              },
+            },
+          },
+        },
+      };
+    },
+  },
+  outbound: {
+    deliveryMode: "direct",
+    chunker: (text, limit) => [text], // Simple chunker for basic implementation
+    textChunkLimit: 5000, // Reasonable limit for Synology Chat
+    sendPayload: async ({ to, payload, accountId, cfg }) => {
+      const runtime = getSynologyChatRuntime();
+      const account = synologyChatPlugin.config.resolveAccount(
+        cfg,
+        accountId ?? DEFAULT_ACCOUNT_ID,
+      );
+
+      if (!account.config.nasIncomingWebhookUrl) {
+        throw new Error("Synology Chat webhook URL not configured");
+      }
+
+      const text = payload.text || "";
+      await sendMessageToSynologyChat(account.config.nasIncomingWebhookUrl, text);
+
+      return { channel: "synology-chat", messageId: "sent", chatId: to };
+    },
+    sendText: async ({ to, text, accountId }) => {
+      const runtime = getSynologyChatRuntime();
+      const cfg = runtime.config.loadConfig ? runtime.config.loadConfig() : {};
+      const account = synologyChatPlugin.config.resolveAccount(
+        cfg,
+        accountId ?? DEFAULT_ACCOUNT_ID,
+      );
+
+      if (!account.config.nasIncomingWebhookUrl) {
+        throw new Error("Synology Chat webhook URL not configured");
+      }
+
+      await sendMessageToSynologyChat(account.config.nasIncomingWebhookUrl, text);
+
+      return { channel: "synology-chat", messageId: "sent", chatId: to };
+    },
+    sendMedia: async ({ to, text, mediaUrl, accountId }) => {
+      const runtime = getSynologyChatRuntime();
+      const cfg = runtime.config.loadConfig ? runtime.config.loadConfig() : {};
+      const account = synologyChatPlugin.config.resolveAccount(
+        cfg,
+        accountId ?? DEFAULT_ACCOUNT_ID,
+      );
+
+      if (!account.config.nasIncomingWebhookUrl) {
+        throw new Error("Synology Chat webhook URL not configured");
+      }
+
+      // For basic implementation, send text with media URL
+      const message = text ? `${text}\n\n${mediaUrl}` : mediaUrl;
+      await sendMessageToSynologyChat(account.config.nasIncomingWebhookUrl, message);
+
+      return { channel: "synology-chat", messageId: "sent", chatId: to };
+    },
+  },
+  status: {
+    defaultRuntime: {
+      accountId: DEFAULT_ACCOUNT_ID,
+      running: false,
+      lastStartAt: null,
+      lastStopAt: null,
+      lastError: null,
+    },
+    collectStatusIssues: (accounts) => {
+      const issues: ChannelStatusIssue[] = [];
+      for (const account of accounts) {
+        const accountId = account.accountId ?? DEFAULT_ACCOUNT_ID;
+        if (!account.config.nasIncomingWebhookUrl?.trim()) {
+          issues.push({
+            channel: "synology-chat",
+            accountId,
+            kind: "config",
+            message: "Synology Chat webhook URL not configured",
+          });
+        }
+      }
+      return issues;
+    },
+    buildChannelSummary: ({ snapshot }) => ({
+      configured: snapshot.configured ?? false,
+      tokenSource: snapshot.tokenSource ?? "none",
+      running: snapshot.running ?? false,
+      mode: snapshot.mode ?? null,
+      lastStartAt: snapshot.lastStartAt ?? null,
+      lastStopAt: snapshot.lastStopAt ?? null,
+      lastError: snapshot.lastError ?? null,
+      probe: snapshot.probe,
+      lastProbeAt: snapshot.lastProbeAt ?? null,
+    }),
+    probeAccount: async ({ account, timeoutMs }) => {
+      // Simple probe by checking if webhook URL is configured
+      if (!account.config.nasIncomingWebhookUrl?.trim()) {
+        return { ok: false, error: "Webhook URL not configured" };
+      }
+
+      try {
+        // Try sending a test message
+        await sendMessageToSynologyChat(account.config.nasIncomingWebhookUrl, "Test connection");
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: String(error) };
+      }
+    },
+    buildAccountSnapshot: ({ account, runtime, probe }) => {
+      const configured = Boolean(account.config.nasIncomingWebhookUrl?.trim());
+      return {
+        accountId: account.accountId,
+        name: account.name,
+        enabled: account.enabled,
+        configured,
+        tokenSource: account.tokenSource,
+        running: runtime?.running ?? false,
+        lastStartAt: runtime?.lastStartAt ?? null,
+        lastStopAt: runtime?.lastStopAt ?? null,
+        lastError: runtime?.lastError ?? null,
+        mode: "webhook",
+        probe,
+        lastInboundAt: runtime?.lastInboundAt ?? null,
+        lastOutboundAt: runtime?.lastOutboundAt ?? null,
+      };
+    },
+  },
+  gateway: {
+    startAccount: async (ctx) => {
+      const account = ctx.account;
+      const port = account.config.port || 9000; // Default to port 9000, but configurable
+      const webhookPath = account.config.incomingWebhookPath || "/synology-chat";
+
+      ctx.log?.info(
+        `[${account.accountId}] starting Synology Chat provider on port ${port} with webhook path: ${webhookPath}`,
+      );
+      ctx.log?.info(
+        `Current config: incomingWebhookPath=${account.config.incomingWebhookPath}, nasIncomingWebhookUrl=${account.config.nasIncomingWebhookUrl}, botName=${account.config.botName}, verificationToken=${!!account.config.verificationToken}`,
+      );
+
+      // Create Express app to handle webhook requests on its own port
+      const express = (await import("express")).default;
+      const app = express();
+
+      // Middleware to parse form data (what Synology Chat sends)
+      app.use(express.urlencoded({ extended: true }));
+
+      // Register the webhook handler on the specific path
+      app.post(webhookPath, createSynologyChatWebhookHandler(ctx));
+
+      // Start server on the designated port
+      const server = app.listen(port, "0.0.0.0", () => {
+        ctx.log?.info(
+          `Synology Chat webhook server running on port ${port} with path: ${webhookPath}`,
+        );
+      });
+
+      // Handle server errors
+      server.on("error", (err) => {
+        ctx.log?.error(`Synology Chat webhook server error on port ${port}:`, err);
+      });
+
+      // Store server reference in context for potential cleanup - removed to fix TypeScript error
+
+      return {
+        stop: async () => {
+          // Close the server when stopping
+          return new Promise<void>((resolve, reject) => {
+            ctx.log?.info(`Stopping Synology Chat webhook server on port ${port}...`);
+
+            server.close((err) => {
+              if (err) {
+                ctx.log?.error(`Synology Chat webhook server error on port ${port}:`, err);
+                // Still resolve despite error as the server is closed
+                resolve();
+              } else {
+                ctx.log?.info(`Synology Chat webhook server stopped on port ${port}`);
+                resolve();
+              }
+            });
+          });
+        },
+      };
+    },
+    logoutAccount: async ({ accountId, cfg }) => {
+      // Clear configuration
+      const envToken = process.env.SYNOLOGY_CHAT_TOKEN?.trim() ?? "";
+      const nextCfg = { ...cfg } as OpenClawConfig;
+      const synologyChatConfig = (cfg.channels?.["synology-chat"] ?? {}) as any;
+      const nextSynologyChat = { ...synologyChatConfig };
+      let cleared = false;
+      let changed = false;
+
+      if (accountId === DEFAULT_ACCOUNT_ID) {
+        if (nextSynologyChat.nasIncomingWebhookUrl || nextSynologyChat.token) {
+          delete nextSynologyChat.nasIncomingWebhookUrl;
+          delete nextSynologyChat.token;
+          cleared = true;
+          changed = true;
+        }
+      }
+
+      const accounts = nextSynologyChat.accounts ? { ...nextSynologyChat.accounts } : undefined;
+      if (accounts && accountId in accounts) {
+        const entry = accounts[accountId];
+        if (entry && typeof entry === "object") {
+          const nextEntry = { ...entry } as Record<string, unknown>;
+          if ("nasIncomingWebhookUrl" in nextEntry || "token" in nextEntry) {
+            cleared = true;
+            delete nextEntry.nasIncomingWebhookUrl;
+            delete nextEntry.token;
+            changed = true;
+          }
+          if (Object.keys(nextEntry).length === 0) {
+            delete accounts[accountId];
+            changed = true;
+          } else {
+            accounts[accountId] = nextEntry as typeof entry;
+          }
+        }
+      }
+
+      if (accounts) {
+        if (Object.keys(accounts).length === 0) {
+          delete nextSynologyChat.accounts;
+          changed = true;
+        } else {
+          nextSynologyChat.accounts = accounts;
+        }
+      }
+
+      if (changed) {
+        if (Object.keys(nextSynologyChat).length > 0) {
+          nextCfg.channels = { ...nextCfg.channels, "synology-chat": nextSynologyChat };
+        } else {
+          const nextChannels = { ...nextCfg.channels };
+          delete (nextChannels as Record<string, unknown>)["synology-chat"];
+          if (Object.keys(nextChannels).length > 0) {
+            nextCfg.channels = nextChannels;
+          } else {
+            delete nextCfg.channels;
+          }
+        }
+        const runtime = getSynologyChatRuntime();
+        await runtime.config.writeConfigFile(nextCfg);
+      }
+
+      const resolved = synologyChatPlugin.config.resolveAccount(changed ? nextCfg : cfg, accountId);
+      const loggedOut = resolved.tokenSource === "none";
+
+      return { cleared, envToken: Boolean(envToken), loggedOut };
+    },
+  },
+  agentPrompt: {
+    messageToolHints: () => [
+      "",
+      "### Synology Chat Messages",
+      "Send messages to Synology Chat using webhook integration.",
+      "",
+      "The bot responds directly through HTTP response when receiving messages.",
+    ],
+  },
+};
+
+// Helper function to send messages to Synology Chat
+async function sendMessageToSynologyChat(webhookUrl: string, text: string): Promise<any> {
+  const payload = {
+    text: text,
+  };
+
+  const data = {
+    payload: JSON.stringify(payload),
+  };
+
+  try {
+    const response = await fetch(webhookUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams(data).toString(),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${await response.text()}`);
+    }
+
+    return await response.json();
+  } catch (error) {
+    throw new Error(
+      `Failed to send message to Synology Chat: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+// Function to create webhook handler for receiving messages
+function createSynologyChatWebhookHandler(ctx: any) {
+  return async (req: any, res: any) => {
+    try {
+      // Parse form data (Synology Chat sends form-encoded data)
+      const formData: Record<string, string> = {};
+
+      // This is a simplified implementation - in a real scenario,
+      // we'd need to properly parse the form data from the request
+      if (req.body) {
+        // If body is already parsed
+        Object.assign(formData, req.body);
+      } else if (req.rawBody) {
+        // Parse form data from raw body
+        const textDecoder = new TextDecoder();
+        const bodyText = textDecoder.decode(req.rawBody);
+        const params = new URLSearchParams(bodyText);
+        for (const [key, value] of params.entries()) {
+          formData[key] = value;
+        }
+      }
+
+      console.log("SYNOLOGY CHAT MESSAGE RECEIVED:");
+      console.log(JSON.stringify(formData, null, 2));
+
+      // Validate the token from Synology Chat (if verification token is configured)
+      const providedToken = formData.token;
+      const expectedToken = ctx.account.config.verificationToken;
+
+      if (expectedToken && providedToken && providedToken !== expectedToken) {
+        console.error(`Invalid token received: ${providedToken}, expected: ${expectedToken}`);
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized: Invalid token" }));
+        return;
+      }
+
+      // Get message content and user info
+      const text = formData.text || "";
+      const username = formData.username || "";
+      const userId = formData.user_id || "";
+
+      // Ignore messages from the bot itself
+      if (username.toLowerCase() === ctx.account.config.botName.toLowerCase()) {
+        console.log("Ignored message from bot itself");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true }));
+        return;
+      }
+
+      // Create context for the agent system
+      const agentContext = {
+        Body: text,
+        From: `synology-chat:${userId || username}`,
+        To: `synology-chat:bot`,
+        SessionKey: `synology-chat-${userId || username}`,
+        AccountId: ctx.account?.accountId || DEFAULT_ACCOUNT_ID,
+        MessageSid: Date.now().toString(),
+        ChatType: "direct",
+        ConversationLabel: `synology-chat-${userId || username}`,
+        SenderName: username,
+        SenderId: userId,
+        Provider: "synology-chat",
+        Surface: "synology-chat",
+        OriginatingChannel: "synology-chat",
+        OriginatingTo: `synology-chat:${userId || username}`,
+      };
+
+      // Process the message with the OpenClaw agent system
+      // Use the configuration passed in via ctx.cfg (standard approach used by other channels)
+      const cfg = ctx.cfg;
+
+      // Use the actual OpenClaw agent system to process the message
+      const replyResult = await getReplyFromConfig(agentContext, undefined, cfg);
+
+      // Extract text from reply result - handle both single payload and array of payloads
+      let replyText = "";
+      if (Array.isArray(replyResult)) {
+        // If it's an array of payloads, get text from the first one that has text
+        const firstPayloadWithText = replyResult.find((payload: any) => payload?.text);
+        replyText = firstPayloadWithText?.text || `Processed: ${text}`;
+      } else if (replyResult && typeof replyResult === "object" && "text" in replyResult) {
+        // If it's a single payload with text property
+        replyText = replyResult.text || `Processed: ${text}`;
+      } else {
+        // Fallback
+        replyText = String(replyResult || `Received: ${text}`);
+      }
+
+      const reply = replyText;
+
+      // Important: Respond with the reply in the HTTP response
+      const responseData = {
+        text: reply,
+      };
+
+      console.log(`Sending reply: ${reply}`);
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(responseData));
+    } catch (error) {
+      console.error("Error handling Synology Chat webhook:", error);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Internal server error" }));
+    }
+  };
+}
+
+// Keep the generateBasicAIResponse function as a fallback but remove the unused functions
+async function generateBasicAIResponse(message: string, username: string): Promise<string> {
+  const lowerMsg = message.toLowerCase();
+
+  // Enhanced rule-based responses to simulate AI behavior better
+  if (lowerMsg.includes("hello") || lowerMsg.includes("hi") || lowerMsg.includes("hey")) {
+    return `Hello ${username}! 👋 I'm OpenClaw, your AI assistant. How can I help you today?`;
+  } else if (lowerMsg.includes("how are you")) {
+    return `I'm doing well, thank you for asking ${username}! I'm here and ready to assist you with any questions or tasks. How can I help?`;
+  } else if (lowerMsg.includes("thank")) {
+    return `You're welcome ${username}! 😊 I'm glad I could help. Is there anything else I can assist you with?`;
+  } else if (lowerMsg.includes("bye") || lowerMsg.includes("goodbye")) {
+    return `Goodbye ${username}! Have a wonderful day! 👋 Feel free to reach out anytime you need assistance.`;
+  } else if (lowerMsg.includes("weather")) {
+    return `I can't check the weather directly, but I can help you find weather tools or services if you'd like! 🌦️`;
+  } else if (lowerMsg.includes("time")) {
+    const now = new Date();
+    return `The current time is: ${now.toLocaleString()} 🕐. Is there something specific about the time or date you'd like to know?`;
+  } else {
+    // For general messages, try to generate a more thoughtful response
+    // In a real implementation, this would connect to the actual AI model
+    try {
+      // We'll simulate a more intelligent response by analyzing the message content
+      let response = `I've received your message: "${message}"\n\n`;
+
+      // Analyze message content and generate appropriate response
+      if (message.length < 5) {
+        // Short message
+        response += `${username}, thanks for reaching out! Could you tell me more about what you'd like help with?`;
+      } else if (message.includes("?")) {
+        // Question
+        response += `${username}, I've received your question. In a real implementation, I would process this with an AI model to provide a detailed answer.`;
+      } else if (/(task|help|assist|do|can you)/i.test(message)) {
+        // Request for assistance
+        response += `${username}, I'd be happy to help! In a full implementation, I would connect to an AI model to understand your request and provide assistance.`;
+      } else {
+        // General message
+        response += `${username}, I've received your message. I'm connecting to an AI model to generate a thoughtful response. For now, I acknowledge your message and am ready to assist you further!`;
+      }
+
+      return response;
+    } catch (e) {
+      return `I've received your message: "${message}"
+
+${username}, how can I assist you further? Type /help to see available commands.`;
+    }
+  }
+}
